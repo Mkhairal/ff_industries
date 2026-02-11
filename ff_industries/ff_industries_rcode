@@ -1,1 +1,114 @@
+get_sic_map <- function(num_ports) {
+
+  valid_ports <- c(5, 10, 12, 17, 30, 38, 48, 49)
+
+  if (!num_ports %in% valid_ports) {
+    warning("Invalid number of industries requested.")
+    return(NULL)
+  }
+
+  url <- sprintf(
+    "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/Siccodes%s.zip",
+    num_ports
+  )
+
+  # download zip to temp file
+  tmp_zip <- tempfile(fileext = ".zip")
+  resp <- tryCatch(
+    download.file(url, tmp_zip, mode = "wb", quiet = TRUE),
+    error = function(e) NULL
+  )
+
+  if (is.null(resp)) {
+    warning("Failed to download file from Ken French's data library.")
+    return(NULL)
+  }
+
+  # unzip
+  tmp_dir <- tempdir()
+  unzip(tmp_zip, exdir = tmp_dir)
+
+  txt_file <- list.files(tmp_dir, full.names = TRUE)[1]
+  defns <- readChar(txt_file, file.info(txt_file)$size)
+
+  defns <- gsub("\r\n", "\n", defns)
+
+  # split industries
+  inds <- regmatches(
+    defns,
+    gregexpr("(\\d+ [A-Za-z]+[\\s\\S]*?)(?=\\n\\s*\\d+ |$)", 
+             defns, perl = TRUE)
+  )[[1]]
+
+  if (length(inds) != num_ports) {
+    stop("Mismatch in number of industries parsed.")
+  }
+
+  all_inds <- list()
+
+  for (ind in inds) {
+
+    parts <- strsplit(ind, "\n", fixed = TRUE)[[1]]
+
+    header <- parts[1]
+    subinds <- if (length(parts) > 1) paste(parts[-1], collapse = "\n") else NULL
+
+    header_match <- regexec("(\\d+)\\s+([A-Za-z]+)", header)
+    header_info <- regmatches(header, header_match)[[1]]
+
+    indid <- as.integer(header_info[2])
+    indname <- header_info[3]
+
+    if (!is.null(subinds)) {
+
+      ranges <- regmatches(
+        subinds,
+        gregexpr("(\\d+)-(\\d+) ?(.*)", subinds, perl = TRUE)
+      )[[1]]
+
+      for (r in ranges) {
+        r_match <- regexec("(\\d+)-(\\d+) ?(.*)", r)
+        r_info <- regmatches(r, r_match)[[1]]
+
+        sic1 <- as.integer(r_info[2])
+        sic2 <- as.integer(r_info[3])
+        sub  <- trimws(r_info[4])
+
+        all_inds[[length(all_inds) + 1]] <- data.frame(
+          id   = indid,
+          ind  = indname,
+          sic1 = sic1,
+          sic2 = sic2,
+          sub  = sub,
+          stringsAsFactors = FALSE
+        )
+      }
+
+    } else {
+      warning(sprintf(
+        'No SIC code ranges provided for industry "%s".',
+        indname
+      ))
+    }
+  }
+
+  inds_df <- do.call(rbind, all_inds)
+
+  # build SIC → industry map
+  inds_dict <- list()
+
+  for (i in seq_len(nrow(inds_df))) {
+    row <- inds_df[i, ]
+
+    for (sic in row$sic1:row$sic2) {
+      inds_dict[[as.character(sic)]] <- list(
+        id  = row$id,
+        ind = row$ind,
+        sub = row$sub
+      )
+    }
+  }
+
+  return(inds_dict)
+}
 
