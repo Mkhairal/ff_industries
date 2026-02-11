@@ -12,6 +12,9 @@ get_sic_map <- function(num_ports) {
   )
 
   tmp_zip <- tempfile(fileext = ".zip")
+  on.exit({
+    if (file.exists(tmp_zip)) unlink(tmp_zip)
+  }, add = TRUE)
 
   status <- tryCatch(
     download.file(url, tmp_zip, mode = "wb", quiet = TRUE),
@@ -23,9 +26,8 @@ get_sic_map <- function(num_ports) {
     return(NULL)
   }
 
-  # Find the files inside the zip, then extract
   zip_list <- unzip(tmp_zip, list = TRUE)
-  if (nrow(zip_list) == 0) stop("Zip file is empty.")
+  if (is.null(zip_list) || nrow(zip_list) == 0) stop("Zip file is empty or unreadable.")
 
   # Prefer .txt if present, else take the first file
   txt_idx <- which(grepl("\\.txt$", zip_list$Name, ignore.case = TRUE))
@@ -33,75 +35,87 @@ get_sic_map <- function(num_ports) {
 
   tmp_dir <- tempfile("sic_zip_")
   dir.create(tmp_dir)
+  on.exit({
+    if (dir.exists(tmp_dir)) unlink(tmp_dir, recursive = TRUE, force = TRUE)
+  }, add = TRUE)
+
   extracted_path <- unzip(tmp_zip, files = target_name, exdir = tmp_dir, overwrite = TRUE)
 
   if (length(extracted_path) != 1 || !file.exists(extracted_path)) {
     stop("Failed to extract SIC definition file from zip.")
   }
 
+  # Read the extracted text
   defns <- paste(readLines(extracted_path, warn = FALSE, encoding = "UTF-8"), collapse = "\n")
   defns <- gsub("\r\n", "\n", defns)
 
-  # Split into industry blocks
-  inds <- regmatches(
-    defns,
-    gregexpr("(\\d+ [A-Za-z]+[\\s\\S]*?)(?=\\n\\s*\\d+ |$)",
-             defns, perl = TRUE)
-  )[[1]]
+  # ---- SAFER split into industry blocks (no one-word assumption) ----
+  # Find header lines: start-of-line, digits, whitespace, then non-empty text
+  hdr_pat <- "(?m)^\\s*\\d+\\s+[^\\n]+$"
+  m <- gregexpr(hdr_pat, defns, perl = TRUE)[[1]]
+
+  if (length(m) == 1 && m[1] == -1) {
+    stop("No industry headers found; file format may have changed.")
+  }
+
+  starts <- as.integer(m)
+  ends <- c(starts[-1] - 1L, nchar(defns))
+
+  inds <- Map(function(s, e) substr(defns, s, e), starts, ends)
+  inds <- unlist(inds, use.names = FALSE)
 
   if (length(inds) != num_ports) {
-    stop(sprintf("Parsed %d industries, expected %d. File format may have changed.",
-                 length(inds), num_ports))
+    stop(sprintf(
+      "Parsed %d industries, expected %d. File format may have changed.",
+      length(inds), num_ports
+    ))
   }
 
   all_inds <- list()
 
-  for (ind in inds) {
+  for (ind_block in inds) {
 
-    parts <- strsplit(ind, "\n", fixed = TRUE)[[1]]
-    header <- parts[1]
-    subinds <- if (length(parts) > 1) paste(parts[-1], collapse = "\n") else NULL
+    lines <- strsplit(ind_block, "\n", fixed = TRUE)[[1]]
+    lines <- lines[nzchar(trimws(lines))]
 
-    header_match <- regexec("(\\d+)\\s+([A-Za-z]+)", header, perl = TRUE)
-    header_info <- regmatches(header, header_match)[[1]]
-    if (length(header_info) < 3) next
+    if (length(lines) == 0) next
 
-    indid <- as.integer(header_info[2])
-    indname <- header_info[3]
+    header <- lines[1]
+    sub_lines <- if (length(lines) > 1) lines[-1] else character(0)
 
-    if (!is.null(subinds) && nchar(trimws(subinds)) > 0) {
+    # Header: digits + whitespace + industry name (allow spaces)
+    h <- regexec("^\\s*(\\d+)\\s+(.+?)\\s*$", header, perl = TRUE)
+    hi <- regmatches(header, h)[[1]]
+    if (length(hi) < 3) next
 
-      ranges <- regmatches(
-        subinds,
-        gregexpr("(\\d+)-(\\d+) ?(.*)", subinds, perl = TRUE)
-      )[[1]]
+    indid <- as.integer(hi[2])
+    indname <- trimws(hi[3])
 
-      if (length(ranges) == 0) {
-        warning(sprintf('No SIC code ranges parsed for industry "%s".', indname))
-        next
-      }
-
-      for (r in ranges) {
-        r_match <- regexec("(\\d+)-(\\d+) ?(.*)", r, perl = TRUE)
-        r_info <- regmatches(r, r_match)[[1]]
-        if (length(r_info) < 4) next
-
-        sic1 <- as.integer(r_info[2])
-        sic2 <- as.integer(r_info[3])
-        sub  <- trimws(r_info[4])
-
-        all_inds[[length(all_inds) + 1]] <- data.frame(
-          id   = indid,
-          ind  = indname,
-          sic1 = sic1,
-          sic2 = sic2,
-          sub  = sub,
-          stringsAsFactors = FALSE
-        )
-      }
-
-    } else {
+    if (length(sub_lines) == 0) {
       warning(sprintf('No SIC code ranges provided for industry "%s".', indname))
+      next
+    }
+
+    # Each SIC range line: "####-#### <optional description>"
+    for (ln in sub_lines) {
+      r <- regexec("^\\s*(\\d+)\\s*-\\s*(\\d+)\\s*(.*)\\s*$", ln, perl = TRUE)
+      ri <- regmatches(ln, r)[[1]]
+      if (length(ri) < 4) next
+
+      sic1 <- suppressWarnings(as.integer(ri[2]))
+      sic2 <- suppressWarnings(as.integer(ri[3]))
+      sub  <- trimws(ri[4])
+
+      if (is.na(sic1) || is.na(sic2) || sic1 > sic2) next
+
+      all_inds[[length(all_inds) + 1]] <- data.frame(
+        id   = indid,
+        ind  = indname,
+        sic1 = sic1,
+        sic2 = sic2,
+        sub  = sub,
+        stringsAsFactors = FALSE
+      )
     }
   }
 
@@ -112,13 +126,12 @@ get_sic_map <- function(num_ports) {
 
   inds_df <- do.call(rbind, all_inds)
 
-  # Build SIC -> (id, ind, sub)
+  # Build SIC -> (id, ind, sub) as a named list
   inds_dict <- vector("list", length = 0)
 
   for (i in seq_len(nrow(inds_df))) {
     row <- inds_df[i, ]
-    if (is.na(row$sic1) || is.na(row$sic2)) next
-    for (sic in row$sic1:row$sic2) {
+    for (sic in seq.int(row$sic1, row$sic2)) {
       inds_dict[[as.character(sic)]] <- list(
         id  = row$id,
         ind = row$ind,
