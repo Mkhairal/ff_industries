@@ -1,7 +1,6 @@
 get_sic_map <- function(num_ports) {
 
   valid_ports <- c(5, 10, 12, 17, 30, 38, 48, 49)
-
   if (!num_ports %in% valid_ports) {
     warning("Invalid number of industries requested.")
     return(NULL)
@@ -12,36 +11,47 @@ get_sic_map <- function(num_ports) {
     num_ports
   )
 
-  # download zip to temp file
   tmp_zip <- tempfile(fileext = ".zip")
-  resp <- tryCatch(
+
+  status <- tryCatch(
     download.file(url, tmp_zip, mode = "wb", quiet = TRUE),
-    error = function(e) NULL
+    error = function(e) 1L
   )
 
-  if (is.null(resp)) {
+  if (!is.numeric(status) || status != 0L || !file.exists(tmp_zip)) {
     warning("Failed to download file from Ken French's data library.")
     return(NULL)
   }
 
-  # unzip
-  tmp_dir <- tempdir()
-  unzip(tmp_zip, exdir = tmp_dir)
+  # Find the files inside the zip, then extract
+  zip_list <- unzip(tmp_zip, list = TRUE)
+  if (nrow(zip_list) == 0) stop("Zip file is empty.")
 
-  txt_file <- list.files(tmp_dir, full.names = TRUE)[1]
-  defns <- readChar(txt_file, file.info(txt_file)$size)
+  # Prefer .txt if present, else take the first file
+  txt_idx <- which(grepl("\\.txt$", zip_list$Name, ignore.case = TRUE))
+  target_name <- if (length(txt_idx) >= 1) zip_list$Name[txt_idx[1]] else zip_list$Name[1]
 
+  tmp_dir <- tempfile("sic_zip_")
+  dir.create(tmp_dir)
+  extracted_path <- unzip(tmp_zip, files = target_name, exdir = tmp_dir, overwrite = TRUE)
+
+  if (length(extracted_path) != 1 || !file.exists(extracted_path)) {
+    stop("Failed to extract SIC definition file from zip.")
+  }
+
+  defns <- paste(readLines(extracted_path, warn = FALSE, encoding = "UTF-8"), collapse = "\n")
   defns <- gsub("\r\n", "\n", defns)
 
-  # split industries
+  # Split into industry blocks
   inds <- regmatches(
     defns,
-    gregexpr("(\\d+ [A-Za-z]+[\\s\\S]*?)(?=\\n\\s*\\d+ |$)", 
+    gregexpr("(\\d+ [A-Za-z]+[\\s\\S]*?)(?=\\n\\s*\\d+ |$)",
              defns, perl = TRUE)
   )[[1]]
 
   if (length(inds) != num_ports) {
-    stop("Mismatch in number of industries parsed.")
+    stop(sprintf("Parsed %d industries, expected %d. File format may have changed.",
+                 length(inds), num_ports))
   }
 
   all_inds <- list()
@@ -49,26 +59,32 @@ get_sic_map <- function(num_ports) {
   for (ind in inds) {
 
     parts <- strsplit(ind, "\n", fixed = TRUE)[[1]]
-
     header <- parts[1]
     subinds <- if (length(parts) > 1) paste(parts[-1], collapse = "\n") else NULL
 
-    header_match <- regexec("(\\d+)\\s+([A-Za-z]+)", header)
+    header_match <- regexec("(\\d+)\\s+([A-Za-z]+)", header, perl = TRUE)
     header_info <- regmatches(header, header_match)[[1]]
+    if (length(header_info) < 3) next
 
     indid <- as.integer(header_info[2])
     indname <- header_info[3]
 
-    if (!is.null(subinds)) {
+    if (!is.null(subinds) && nchar(trimws(subinds)) > 0) {
 
       ranges <- regmatches(
         subinds,
         gregexpr("(\\d+)-(\\d+) ?(.*)", subinds, perl = TRUE)
       )[[1]]
 
+      if (length(ranges) == 0) {
+        warning(sprintf('No SIC code ranges parsed for industry "%s".', indname))
+        next
+      }
+
       for (r in ranges) {
-        r_match <- regexec("(\\d+)-(\\d+) ?(.*)", r)
+        r_match <- regexec("(\\d+)-(\\d+) ?(.*)", r, perl = TRUE)
         r_info <- regmatches(r, r_match)[[1]]
+        if (length(r_info) < 4) next
 
         sic1 <- as.integer(r_info[2])
         sic2 <- as.integer(r_info[3])
@@ -85,21 +101,23 @@ get_sic_map <- function(num_ports) {
       }
 
     } else {
-      warning(sprintf(
-        'No SIC code ranges provided for industry "%s".',
-        indname
-      ))
+      warning(sprintf('No SIC code ranges provided for industry "%s".', indname))
     }
+  }
+
+  if (length(all_inds) == 0) {
+    warning("No SIC ranges parsed; returning NULL.")
+    return(NULL)
   }
 
   inds_df <- do.call(rbind, all_inds)
 
-  # build SIC → industry map
-  inds_dict <- list()
+  # Build SIC -> (id, ind, sub)
+  inds_dict <- vector("list", length = 0)
 
   for (i in seq_len(nrow(inds_df))) {
     row <- inds_df[i, ]
-
+    if (is.na(row$sic1) || is.na(row$sic2)) next
     for (sic in row$sic1:row$sic2) {
       inds_dict[[as.character(sic)]] <- list(
         id  = row$id,
@@ -109,6 +127,5 @@ get_sic_map <- function(num_ports) {
     }
   }
 
-  return(inds_dict)
+  inds_dict
 }
-
